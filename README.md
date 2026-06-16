@@ -1,284 +1,156 @@
-# Evo 2: Genome modeling and design across all domains of life
+# evo2Mac
 
-![Evo 2](evo2.jpg)
+A macOS / Apple Silicon (MPS) port of [Evo 2](https://github.com/arcinstitute/evo2)
+— Arc Institute's DNA language model — for local inference on Mac.
 
-Evo 2 is a state of the art DNA language model for long context modeling and design. Evo 2 models DNA sequences at single-nucleotide resolution at up to 1 million base pair context length using the [StripedHyena 2](https://github.com/Zymrael/savanna/blob/main/paper.pdf) architecture. Evo 2 was pretrained using [Savanna](https://github.com/Zymrael/savanna). Evo 2 was trained autoregressively on [OpenGenome2](https://huggingface.co/datasets/arcinstitute/opengenome2), a dataset containing 8.8 trillion tokens from all domains of life.
+> This is a fork of [arcinstitute/evo2](https://github.com/arcinstitute/evo2)
+> with edits to the device handling, FP8 fallback, and config defaults so the
+> 1B and 7B Evo 2 checkpoints can run on Apple Silicon via MPS.
+>
+> Upstream documentation is preserved in [`README.upstream.md`](README.upstream.md).
 
-We describe Evo 2 in our paper:
-["Genome modeling and design across all domains of life with Evo 2"](https://www.nature.com/articles/s41586-026-10176-5).
+## Why a port?
 
-> [!NOTE]
-> - **Evo 2 published**: read more in [Nature](https://www.nature.com/articles/s41586-026-10176-5).
-> - **Evo 2 20B released**: 40B-level performance with double the speed, read more [here](https://github.com/ArcInstitute/evo2/releases/tag/v0.5.0).
-> - **Light install for 7B models**: option compatible with more hardware, see [Installation](#installation).
+Upstream Evo 2 depends on `flash-attn` and NVIDIA Transformer Engine, both of
+which are CUDA-only. This fork:
 
-## Contents
+1. Disables `use_flash_attn` and `use_fp8_input_projections` in the YAML
+   configs (PyTorch SDPA + bf16 work on MPS).
+2. Adds MPS-aware device detection in `evo2/models.py` and `evo2/scoring.py`.
+3. Extends the bf16 fallback (when Transformer Engine is missing) to also
+   cover the 1B model — upstream only falls back for 7B.
+4. Provides a runtime patcher (`patches/patch_vortex.py`) that fixes three
+   CUDA-isms in the installed `vortex` (`vtx` on PyPI) package:
+   - `torch.autocast("cuda")` → device-aware autocast
+   - `torch.fft.fft(...).repeat(...)` → `.unsqueeze().expand()`
+     (MPS doesn't support `.repeat` on complex tensors in PT 2.x)
+   - `torch.cuda.empty_cache()` / `torch.cuda.memory_allocated()` → device-aware
 
-- [Setup](#setup)
-  - [Requirements](#requirements)
-  - [Installation](#installation)
-  - [Docker](#docker)
-- [Usage](#usage)
-  - [Checkpoints](#checkpoints)
-  - [Forward](#forward)
-  - [Embeddings](#embeddings)
-  - [Generation](#generation)
-- [Notebooks](#notebooks)
-- [Nvidia NIM](#nvidia-nim)
-- [Dataset](#dataset)
-- [Training and Finetuning](#training-and-finetuning)
-- [Citation](#citation)
+The patcher writes `.bak` files and is idempotent — re-running is safe, and
+`python patches/patch_vortex.py --restore` puts the originals back.
 
-## Setup
+## Models
 
-This repo is for running Evo 2 locally for inference or generation, using our [Vortex](https://github.com/Zymrael/vortex) inference code. For training and finetuning, see the section [here](#training-and-finetuning).
-You can run Evo 2 without any installation using the [Nvidia Hosted API](https://build.nvidia.com/arc/evo2-40b).
-You can also self-host an instance using Nvidia NIM. See the [Nvidia NIM](#nvidia-nim) section for more 
-information.
+| Checkpoint            | Size (bf16) | Runs on Mac?              |
+|-----------------------|-------------|---------------------------|
+| `evo2_1b_base`        | ~4 GB       | ✓ 16 GB unified mem OK    |
+| `evo2_7b`             | ~14 GB      | ✓ needs 32 GB+ Mac        |
+| `evo2_7b_base`        | ~14 GB      | ✓ needs 32 GB+ Mac        |
+| `evo2_7b_262k`        | ~14 GB      | ✓ needs 32 GB+ Mac        |
+| `evo2_7b_microviridae`| ~14 GB      | ✓ needs 32 GB+ Mac        |
+| `evo2_20b`            | ~40 GB      | ✗ requires FP8 + Hopper   |
+| `evo2_40b`            | ~80 GB      | ✗ requires FP8 + Hopper   |
+| `evo2_40b_base`       | ~80 GB      | ✗ requires FP8 + Hopper   |
 
-### Requirements
+The 20B/40B exclusion is a *runtime* constraint (Transformer Engine + Hopper
+GPUs), not just a memory one. They will not run on Apple Silicon even if it
+fit. Long-context 7B (`evo2_7b`, 1M context) is technically loadable but the
+prefill cost on MPS will be painful — start with `evo2_7b_262k` or
+`evo2_7b_base` (8K context).
 
-Evo 2 is built on the Vortex inference repo, see the [Vortex github](https://github.com/Zymrael/vortex) for more details and Docker option.
+## Quick start
 
-**System requirements**
-- [OS] Linux (official) or WSL2 (limited support)
-- [Software]
-	- CUDA: 12.1+ with compatible NVIDIA drivers
-	- cuDNN: 9.3+
-	- Compiler: GCC 9+ or Clang 10+ with C++17 support
-	- Python 3.11 or 3.12
-- Recommended Torch 2.6.x or 2.7.x
-
-**FP8 and Transformer Engine requirements**
-
-The 40B, 20B, and 1B models require FP8 via [Transformer Engine](https://github.com/NVIDIA/TransformerEngine) for numerical accuracy and a Nvidia Hopper GPU. The 7B models can run in bfloat16 without Transformer Engine on any supported GPU.
-
-| Model | FP8 (Transformer Engine) Required |
-|-------|-----------------------------------|
-| `evo2_7b` / `evo2_7b_262k` / `evo2_7b_base`   | No |
-| `evo2_20b` | Yes |
-| `evo2_40b` / `evo2_40b_base` | Yes |
-| `evo2_1b_base` | Yes |
-
-Always validate model outputs after configuration changes or on different hardware by using the tests.
-
-### Installation
-
-**Full install**
-
-Install [Transformer Engine](https://github.com/NVIDIA/TransformerEngine) and [Flash Attention](https://github.com/Dao-AILab/flash-attention/tree/main) first, then install Evo 2. We recommend using conda to install Transformer Engine:
-```bash
-conda install -c nvidia cuda-nvcc cuda-cudart-dev
-conda install -c conda-forge transformer-engine-torch=2.3.0
-pip install flash-attn==2.8.0.post2 --no-build-isolation
-pip install evo2
-```
-
-**Light install (7B models only, no Transformer Engine)**
-
-Evo 2 7B models can run without Transformer Engine or FP8-capable hardware. If you run into issues installing Flash Attention, see the [Flash Attention GitHub](https://github.com/Dao-AILab/flash-attention/tree/main) for system requirements and troubleshooting.
+Prerequisites: Apple Silicon Mac, macOS 14+, [Homebrew](https://brew.sh).
 
 ```bash
-# A compatible PyTorch must be installed before flash attention, for example: pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
-pip install flash-attn==2.8.0.post2 --no-build-isolation
-pip install evo2
+git clone https://github.com/wabi-media/evo2Mac.git
+cd evo2Mac
+./scripts/setup.sh
+conda activate evo2Mac
+
+# 1. Quick smoke test (one forward pass)
+python scripts/smoke_test.py --model evo2_1b_base
+
+# 2. Full DNA pipeline: tokenize -> forward -> embed -> score -> generate
+python scripts/test_dna.py --model evo2_1b_base
+
+# 3. Compare numerical results to upstream's CUDA reference values
+python scripts/compare_to_upstream.py --model evo2_1b_base
 ```
 
-**From source**
+`setup.sh` will:
+1. Install miniforge via Homebrew (skip if present).
+2. Create a Python 3.11 conda env named `evo2Mac`.
+3. Install PyTorch with MPS support.
+4. Install `vtx` (the StripedHyena 2 runtime; imported as `vortex`).
+5. Install this package in editable mode (`pip install -e . --no-deps`).
+6. Apply the runtime patches to the installed `vortex` package.
 
-```bash
-git clone https://github.com/arcinstitute/evo2
-cd evo2
-pip install -e .
-```
+On first model load, the checkpoint is downloaded into your HuggingFace cache
+(`~/.cache/huggingface/`). Change with `HF_HOME=/path/to/cache`.
 
-**Verify installation**
+## Verifying correctness vs upstream
 
-```bash
-python -m evo2.test.test_evo2_generation --model_name evo2_7b  # or evo2_1b_base, evo2_20b, evo2_40b
-```
+`scripts/compare_to_upstream.py` runs upstream's own bundled `prompts.csv`
+through the model and compares the mean cross-entropy and next-token
+accuracy against the reference numbers baked into upstream's
+`evo2/test/test_evo2.py`. Those reference values were measured on
+H100 + FP8 + flash-attn. Our port runs in bf16 + SDPA on MPS, so a small
+drift is expected:
 
-### Docker
+| Tolerance | Loss (cross-entropy) | Accuracy (pp) |
+|-----------|----------------------|---------------|
+| OK        | drift ≤ 0.05         | drift ≤ 1.5   |
+| WARN      | 0.05 < drift ≤ 0.15  | 1.5 < drift ≤ 5 |
+| FAIL      | drift > 0.15         | drift > 5     |
 
-Evo 2 can be run using Docker (shown below), Singularity, or Apptainer.
-
-```bash
-docker build -t evo2 .
-docker run -it --rm --gpus '"device=0"' -v ./huggingface:/root/.cache/huggingface evo2 bash
-```
-Note: The volume mount (-v) preserves downloaded models between container runs and specifies where they are saved.
-
-Once inside the container:
-
-```bash
-python -m evo2.test.test_evo2_generation --model_name evo2_7b
-```
+A failure here means the port is producing meaningfully different outputs
+and something is wrong — it's the canary that should run on every fresh
+install.
 
 ## Usage
 
-### Checkpoints
-
-We provide the following model checkpoints, hosted on [HuggingFace](https://huggingface.co/arcinstitute):
-| Checkpoint Name                        | Description |
-|----------------------------------------|-------------|
-| `evo2_40b`  | 40B parameter model with 1M context |
-| `evo2_20b`  | 20B parameter model with 1M context |
-| `evo2_7b`  | 7B parameter model with 1M context |
-| `evo2_40b_base`  | 40B parameter model with 8K context |
-| `evo2_7b_base`  | 7B parameter model with 8K context |
-| `evo2_1b_base`  | Smaller 1B parameter model with 8K context |
-| `evo2_7b_262k`  | 7B parameter model with 262K context |
-| `evo2_7b_microviridae`  | 7B parameter base model fine-tuned on Microviridae genomes |
-
-**Note:** The 40B model requires multiple H100 GPUs. Vortex automatically handles device placement, splitting the model across available CUDA devices.
-
-### Forward
-
-Evo 2 can be used to score the likelihoods across a DNA sequence.
-
 ```python
 import torch
 from evo2 import Evo2
 
-evo2_model = Evo2('evo2_7b')
+m = Evo2("evo2_1b_base")          # auto-detects MPS / CUDA / CPU
+print("device:", m.device)
 
-sequence = 'ACGT'
-input_ids = torch.tensor(
-    evo2_model.tokenizer.tokenize(sequence),
-    dtype=torch.int,
-).unsqueeze(0).to('cuda:0')
+ids = torch.tensor(m.tokenizer.tokenize("ACGTACGT"), dtype=torch.int).unsqueeze(0)
+logits, _ = m(ids)
+print(logits.shape)               # (1, 8, 512)
 
-outputs, _ = evo2_model(input_ids)
-logits = outputs[0]
+# Scoring
+scores = m.score_sequences(["ACGTACGT", "GATTACA"])
 
-print('Logits: ', logits)
-print('Shape (batch, length, vocab): ', logits.shape)
+# Generation (cached sampling works on MPS)
+out = m.generate(prompt_seqs=["ACGT"], n_tokens=64, temperature=1.0, top_k=4)
+print(out.sequences[0])
 ```
 
-### Embeddings
+## Keeping in sync with upstream
 
-Evo 2 embeddings can be saved for use downstream. We find that intermediate embeddings work better than final embeddings, see our paper for details.
+```bash
+git remote -v
+# origin    https://github.com/wabi-media/evo2Mac.git    (your fork)
+# upstream  https://github.com/arcinstitute/evo2.git     (Arc Institute)
 
-```python
-import torch
-from evo2 import Evo2
-
-evo2_model = Evo2('evo2_7b')
-
-sequence = 'ACGT'
-input_ids = torch.tensor(
-    evo2_model.tokenizer.tokenize(sequence),
-    dtype=torch.int,
-).unsqueeze(0).to('cuda:0')
-
-layer_name = 'blocks.28.mlp.l3'
-
-outputs, embeddings = evo2_model(input_ids, return_embeddings=True, layer_names=[layer_name])
-
-print('Embeddings shape: ', embeddings[layer_name].shape)
+git fetch upstream
+git merge upstream/main         # or rebase, your call
 ```
 
-### Generation
+When upstream lands changes to `evo2/models.py`, `evo2/scoring.py`, or the
+configs, you may have to redo the Mac edits — they're small and well-marked
+with `# evo2Mac:` comments.
 
-Evo 2 can generate DNA sequences based on prompts.
+## What this port does *not* do
 
-```python
-from evo2 import Evo2
+- It does **not** redistribute model weights — those come from HuggingFace on
+  first use.
+- It does **not** train / fine-tune. Inference only.
+- It does **not** make 20B/40B run on Mac. Those need Hopper GPUs.
 
-evo2_model = Evo2('evo2_7b')
+## Credits
 
-output = evo2_model.generate(prompt_seqs=["ACGT"], n_tokens=400, temperature=1.0, top_k=4)
+- Upstream model + reference code: [arcinstitute/evo2](https://github.com/arcinstitute/evo2)
+  (Arc Institute, Michael Poli, Stanford University). Apache 2.0.
+- The Mac compatibility notes that informed this fork's patches: the
+  [hakyimlab/evo2-mac](https://github.com/hakyimlab/evo2-mac) effort by the
+  Im Lab at UChicago.
+- StripedHyena 2 / Vortex runtime: Together. See [`NOTICE.upstream`](NOTICE.upstream).
 
-print(output.sequences[0])
-```
+## License
 
-## Notebooks
-
-We provide example notebooks.
-
-The [BRCA1 scoring notebook](https://github.com/ArcInstitute/evo2/blob/main/notebooks/brca1/brca1_zero_shot_vep.ipynb) shows zero-shot *BRCA1* variant effect prediction. This example includes a walkthrough of:
-- Performing zero-shot *BRCA1* variant effect predictions using Evo 2
-- Reference vs alternative allele normalization
-
-The [generation notebook](https://github.com/ArcInstitute/evo2/blob/main/notebooks/generation/generation_notebook.ipynb) shows DNA sequence completion with Evo 2. This example shows:
-- DNA prompt based generation and 'DNA autocompletion'
-- How to get and prompt using phylogenetic species tags for generation
-
-The [exon classifier notebook](https://github.com/ArcInstitute/evo2/blob/main/notebooks/exon_classifier/exon_classifier.ipynb) demonstrates exon classification using Evo 2 embeddings. This example shows:
-- Running the Evo 2 based exon classifier
-- Performance metrics and visualization
-
-The [sparse autoencoder (SAE) notebook](https://github.com/ArcInstitute/evo2/blob/main/notebooks/sparse_autoencoder/sparse_autoencoder.ipynb) explores interpretable features learned by Evo 2. This example includes:
-- Running and visualizing Evo 2 SAE features
-- Demonstrating SAE features on a part of the *E. coli* genome
-
-
-## Nvidia NIM
-
-Evo 2 is available on [Nvidia NIM](https://catalog.ngc.nvidia.com/containers?filters=&orderBy=scoreDESC&query=evo2&page=&pageSize=) and [hosted API](https://build.nvidia.com/arc/evo2-40b).
-
-- [Documentation](https://docs.nvidia.com/nim/bionemo/evo2/latest/overview.html)
-- [Quickstart](https://docs.nvidia.com/nim/bionemo/evo2/latest/quickstart-guide.html)
-
-The quickstart guides users through running Evo 2 on the NVIDIA NIM using a python or shell client after starting NIM. An example python client script is shown below. This is the same way you would interact with the [Nvidia hosted API](https://build.nvidia.com/arc/evo2-40b?snippet_tab=Python).
-
-```python
-#!/usr/bin/env python3
-import requests
-import os
-import json
-from pathlib import Path
-
-key = os.getenv("NVCF_RUN_KEY") or input("Paste the Run Key: ")
-
-r = requests.post(
-    url=os.getenv("URL", "https://health.api.nvidia.com/v1/biology/arc/evo2-40b/generate"),
-    headers={"Authorization": f"Bearer {key}"},
-    json={
-        "sequence": "ACTGACTGACTGACTG",
-        "num_tokens": 8,
-        "top_k": 1,
-        "enable_sampled_probs": True,
-    },
-)
-
-if "application/json" in r.headers.get("Content-Type", ""):
-    print(r, "Saving to output.json:\n", r.text[:200], "...")
-    Path("output.json").write_text(r.text)
-elif "application/zip" in r.headers.get("Content-Type", ""):
-    print(r, "Saving large response to data.zip")
-    Path("data.zip").write_bytes(r.content)
-else:
-    print(r, r.headers, r.content)
-```
-
-
-### Very long sequences
-
-You can use [Savanna](https://github.com/Zymrael/savanna) or [Nvidia BioNemo](https://github.com/NVIDIA/bionemo-framework) for embedding long sequences. Vortex can currently compute over very long sequences via teacher prompting, however please note that forward pass on long sequences may currently be slow.
-
-## Dataset
-
-The OpenGenome2 dataset used for pretraining Evo2 is available on [HuggingFace ](https://huggingface.co/datasets/arcinstitute/opengenome2). Data is available either as raw fastas or as JSONL files which include preprocessing and data augmentation.
-
-## Training and Finetuning
-
-Evo 2 was trained using [Savanna](https://github.com/Zymrael/savanna), an open source framework for training alternative architectures.
-
-To train or finetune Evo 2, you can use [Savanna](https://github.com/Zymrael/savanna) or [Nvidia BioNemo](https://github.com/NVIDIA/bionemo-framework) which provides a [Evo 2 finetuning tutorial here](https://github.com/NVIDIA/bionemo-framework/blob/ca16c2acf9bf813d020b6d1e2d4e1240cfef6a69/docs/docs/user-guide/examples/bionemo-evo2/fine-tuning-tutorial.ipynb).
-
-## Citation
-
-If you find these models useful for your research, please cite the relevant papers
-
-```
-@article{Brixi2026,
-    author  = {Brixi, Garyk and Durrant, Matthew G. and Ku, Jerome and Naghipourfar, Mohsen and Poli, Michael and Sun, Gwanggyu and Brockman, Greg and Chang, Daniel and Fanton, Alison and Gonzalez, Gabriel A. and King, Samuel H. and Li, David B. and Merchant, Aditi T. and Nguyen, Eric and Ricci-Tam, Chiara and Romero, David W. and Schmok, Jonathan C. and Taghibakhshi, Ali and Vorontsov, Anton and Yang, Brandon and Deng, Myra and Gorton, Liv and Nguyen, Nam and Wang, Nicholas K. and Pearce, Michael T. and Simon, Elana and Adams, Etowah and Amador, Zachary J. and Ashley, Euan A. and Baccus, Stephen A. and Dai, Haoyu and Dillmann, Steven and Ermon, Stefano and Guo, Daniel and Herschl, Michael H. and Ilango, Rajesh and Janik, Ken and Lu, Amy X. and Mehta, Reshma and Mofrad, Mohammad R. K. and Ng, Madelena Y. and Pannu, Jaspreet and Ré, Christopher and St. John, John and Sullivan, Jeremy and Tey, Joseph and Viggiano, Ben and Zhu, Kevin and Zynda, Greg and Balsam, Daniel and Collison, Patrick and Costa, Anthony B. and Hernandez-Boussard, Tina and Ho, Eric and Liu, Ming-Yu and McGrath, Thomas and Powell, Kimberly and Pinglay, Sudarshan and Burke, Dave P. and Goodarzi, Hani and Hsu, Patrick D. and Hie, Brian L.},
-    title   = {Genome modelling and design across all domains of life with Evo 2},
-    journal = {Nature},
-    year    = {2026},
-    doi     = {10.1038/s41586-026-10176-5},
-    url     = {https://doi.org/10.1038/s41586-026-10176-5},
-}
-```
-
+Apache License 2.0 — see [`LICENSE`](LICENSE). Modifications and attribution
+in [`NOTICE`](NOTICE).
