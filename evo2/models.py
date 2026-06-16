@@ -69,6 +69,14 @@ class Evo2:
         self.device = _get_default_device()
         if not torch.cuda.is_available():
             self.model = self.model.to(self.device)
+            # StripedHyena tracks per-block placement in a plain dict that
+            # .to() doesn't migrate. The final forward does
+            # `x = x.to(self.block_idx_to_device[0])` before the unembed,
+            # which would yank x back to CPU. Rewrite the dict so every
+            # entry points at our actual device.
+            if hasattr(self.model, "block_idx_to_device"):
+                for k in list(self.model.block_idx_to_device):
+                    self.model.block_idx_to_device[k] = self.device
     
     def forward(
         self,
