@@ -70,19 +70,23 @@ analysis and measured numbers.)
 | `evo2_7b_262k`        | ~14 GB      | off          | ✓ bf16-native (262K context)           |
 | `evo2_7b_microviridae`| ~14 GB      | off          | ✓ bf16-native                          |
 | `evo2_1b_base`        | ~4 GB       | **on**       | ✓ FP8 e4m3 **emulated** (~75% acc)     |
-| `evo2_20b`            | ~40 GB      | **on**       | ~ emulated; memory-tight (≥48 GB Mac)  |
-| `evo2_40b` / `_base`  | ~80 GB      | **on**       | ~ emulated; needs ≥96 GB unified mem   |
+| `evo2_20b`            | ~40 GB      | **on**       | ⚠ loads/runs but near-random (see below) |
+| `evo2_40b` / `_base`  | ~80 GB      | **on**       | ✗ needs ≥96 GB unified mem to load     |
 
 Notes:
 - **`evo2_1b_base` runs with FP8 e4m3 emulation by default** on Mac — recovering
   it from near-random (bf16) to ~75% forward accuracy / ~74% generation identity
   vs the H100 reference. Still a step below the bf16-native 7B; use a 7B-8k model
   when you want the most accurate results. Opt out with `EVO2MAC_FP8_EMULATION=0`.
-- **20B/40B are now code-enabled** (FP8 emulation applies, configs are Mac-patched
-  to drop the Transformer Engine / Hopper / flash-attn dependencies). The only
-  remaining barrier is **memory**: 20B needs ~40 GB of unified memory (tight on a
-  64 GB Mac — an 8K forward pass can OOM), and 40B needs ~80 GB of weights, so it
-  will not load on a 64 GB machine. `Evo2()` prints a memory pre-flight warning.
+- **20B/40B are code-enabled and load** (configs are Mac-patched to drop the
+  Transformer Engine / Hopper / flash-attn dependencies; 20B loads and runs on a
+  64 GB Mac, 40B needs ≥96 GB). **But they are not yet numerically usable on Mac:**
+  unlike the 1B (FP8 only on input projections, which our emulation covers), the
+  20B/40B were FP8-trained on ~120 layers — projections *and* every MLP, the
+  out-projection, and attention. Our e4m3 emulation currently covers only the
+  input projections, so 20B output stays near-random (24% vs the 91.7% H100 ref).
+  Full recovery needs the emulation extended to those layer types — tracked as
+  future work. Use a 7B-8k (or the 1B with emulation) for real results today.
 - **Memory:** the 7B (~14 GB weights) loads on a 16–18 GB Mac, but a full
   8K-context forward pass overruns the MPS allocation watermark. Cap the context
   with `--max-len 2048` (and optionally `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`)
