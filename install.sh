@@ -90,6 +90,7 @@ fi
 log "installing local evo2Mac package (editable, no deps)..."
 pip install --no-deps -e "$REPO_ROOT"
 pip install biopython huggingface_hub pyyaml "einops>=0.8" packaging rich tqdm numpy
+pip install pandas openpyxl   # BRCA1 VEP / batch scoring
 pip install "gradio>=4.0,<6"   # webapp.py
 
 # 6. Apply runtime vortex patches
