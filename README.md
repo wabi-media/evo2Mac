@@ -5,8 +5,9 @@ A macOS / Apple Silicon (MPS) port of [Evo 2](https://github.com/arcinstitute/ev
 
 ![evo2Mac web UI](docs/webui.png)
 
-> Web UI (`./webui.sh start`) with Forward / Score / Generate tabs, running the
-> 7B Evo 2 model locally on Apple Silicon via MPS.
+> Web UI (`./webui.sh start`) with Forward / Score / Variant / Embeddings /
+> Batch / Generate tabs, running the 7B Evo 2 model locally on Apple Silicon
+> via MPS.
 
 > This is a fork of [arcinstitute/evo2](https://github.com/arcinstitute/evo2)
 > with edits to the device handling, FP8 fallback, and config defaults so the
@@ -132,6 +133,30 @@ the installed `vortex` in place, so they must be re-applied on every machine.
 On first model load, the checkpoint is downloaded into your HuggingFace cache
 (`~/.cache/huggingface/`). Change with `HF_HOME=/path/to/cache`.
 
+## Web UI features
+
+`./webui.sh start` (or `python webapp.py`) opens a Gradio app at
+http://localhost:7860 that exposes Evo 2's full inference surface. One shared
+model selector (lazy-loaded and cached) drives six tabs:
+
+| Tab | What it does |
+|-----|--------------|
+| **Forward** | Single forward pass. Shows the predicted next-base distribution `P(A,C,G,T)` at the last position, plus an optional per-position confidence track — the model's probability of the true next base at every position (a "how predictable is this sequence" readout). |
+| **Score** | Sequence log-likelihood under the model. Choose the reduction (**mean** per-base average or **sum** / pseudo-log-likelihood), optionally average with the **reverse complement**, and optionally **prepend BOS**. |
+| **Variant** | Score a **wild-type** vs a **mutant** sequence and report the Δ log-likelihood (mut − wt) — Evo 2's flagship variant-effect use. A more-negative Δ means the variant lowers the model's likelihood (a proxy for functional disruption). Side-by-side bar plot. |
+| **Embeddings** | Extract hidden-state embeddings from a chosen layer (e.g. `blocks.10.mlp.l3`). Reports the `(positions × hidden-dim)` shape and per-tensor stats, and offers the full array as a `.npy` download for downstream ML. |
+| **Batch** | Score many sequences at once — paste one per line or upload a **FASTA** file (`.fasta`/`.fa`/`.fna`). Results come back as a sortable table (id, length, logprob) with a **CSV** download. Capped at 256 sequences per batch. |
+| **Generate** | Autoregressive continuation from a prompt, with `n_tokens`, `temperature`, `top_k`, and `top_p` controls. Reports tokens/sec and the mean log-prob (confidence) of the generated tokens. |
+
+All tabs validate input as ACGT-only, run on MPS (or CPU fallback), and surface
+a banner when an FP8-degraded checkpoint (`evo2_1b_base`) is selected. Override
+the bind host/port with `EVO2MAC_HOST` / `EVO2MAC_PORT`, or expose a public
+Gradio share link with `EVO2MAC_SHARE=1`.
+
+> The screenshot above shows an earlier 3-tab layout. To regenerate it against
+> the current UI: `./webui.sh start`, open http://localhost:7860 in a browser,
+> and save a full-page capture to `docs/webui.png`.
+
 ## Verifying correctness vs upstream
 
 `scripts/compare_to_upstream.py` runs upstream's own bundled `prompts.csv`
@@ -235,6 +260,11 @@ upstream (H100, FP8, flash-attn):  loss=0.3521  acc=85.921%
 evo2Mac (MPS, bf16):                loss=0.3521  acc=85.979%   (Δloss +0.0001, Δacc +0.058pp)
 -> loss within ±0.05: OK; accuracy within ±1.5pp: OK; port matches upstream within tolerance
 ```
+
+This result reproduces bit-for-bit after a fresh `install.sh` on a newly
+migrated machine (verified 2026-06-16): the full test suite — `smoke_test.py`,
+`test_dna.py` (all six stages), and `compare_to_upstream.py` — passes on
+`evo2_7b_base` with the same Δloss +0.0001 / Δacc +0.058pp.
 
 For reference, the earlier M3 Pro (18 GB) run truncated to 2048 bases
 (`--max-len 2048`, see memory note below) landed at loss=0.391 / acc=83.95%
