@@ -45,20 +45,22 @@ import torch
 # the default. Lead with the bf16-native 7B-8k checkpoints (the ones that
 # reproduce upstream on Mac). evo2_1b_base is last; it runs with FP8 emulation.
 MAC_FEASIBLE = {
-    "evo2_7b_base":         "~14 GB   bf16-native, recommended",
-    "evo2_7b":              "~14 GB   bf16-native (1M ctx)",
-    "evo2_7b_262k":         "~14 GB   bf16-native (262K ctx)",
-    "evo2_7b_microviridae": "~14 GB   bf16-native",
-    "evo2_1b_base":         "~4 GB    FP8 e4m3 emulation (auto)",
+    "evo2_7b_base":         "14 GB · bf16-native · recommended",
+    "evo2_7b":              "14 GB · bf16-native · 1M ctx",
+    "evo2_7b_262k":         "14 GB · bf16-native · 262K ctx",
+    "evo2_7b_microviridae": "14 GB · bf16-native",
+    "evo2_1b_base":         "4 GB · FP8 emulated",
+    "evo2_20b":             "40 GB · FP8 emulated · needs big RAM",
 }
 
 DEFAULT_MODEL = "evo2_7b_base"
 
 # Models that are FP8-trained and so run with e4m3 emulation on Mac (the Evo2
 # loader applies it automatically). Without it they'd be near-random; with it
-# the 1B recovers to ~75% forward accuracy / ~67% generation identity. Still a
-# notch below the bf16-native 7B, so we surface an informational banner.
-FP8_EMULATED = {"evo2_1b_base"}
+# the 1B recovers to ~75% forward / ~74% generation identity. Confirmed: 20B
+# also loads + runs (short contexts) on a 64 GB Mac. Still below the bf16-native
+# 7B in accuracy, so we surface an informational banner.
+FP8_EMULATED = {"evo2_1b_base", "evo2_20b", "evo2_40b", "evo2_40b_base"}
 
 # blocks.10.mlp.l3 exists for both 1B (15 blocks) and 7B (32 blocks); it is the
 # layer exercised by scripts/test_dna.py and a safe default for embeddings.
@@ -78,6 +80,12 @@ EXAMPLE_SEQ = "ATGGCCATTGTAATGGGCCGCTGAAAGGGTGCCCGATAG"
 
 _model_cache: dict[str, object] = {}
 
+# Approx download size per model (for the "needs download" hint).
+_APPROX_DOWNLOAD = {
+    "evo2_7b_base": "≈14 GB", "evo2_7b": "≈14 GB", "evo2_7b_262k": "≈14 GB",
+    "evo2_7b_microviridae": "≈14 GB", "evo2_1b_base": "≈4 GB", "evo2_20b": "≈40 GB",
+}
+
 
 def _device_info() -> str:
     if torch.cuda.is_available():
@@ -87,8 +95,39 @@ def _device_info() -> str:
     return "Falling back to CPU — this will be slow"
 
 
-def _get_model(name: str):
+def _is_cached(name: str) -> bool:
+    """True if the model's merged .pt is already in the HF cache."""
+    import glob
+    return bool(glob.glob(os.path.expanduser(f"~/.cache/huggingface/**/{name}.pt"), recursive=True))
+
+
+def _hf_repo(name: str) -> str | None:
+    try:
+        from evo2.utils import HF_MODEL_NAME_MAP
+        return HF_MODEL_NAME_MAP.get(name)
+    except Exception:
+        return None
+
+
+def _ensure_downloaded(name: str, progress) -> None:
+    """Download the model from HuggingFace if not cached, driving a Gradio
+    progress bar from the underlying tqdm transfer bars."""
+    if _is_cached(name):
+        return
+    repo = _hf_repo(name)
+    size = _APPROX_DOWNLOAD.get(name, "several GB")
+    progress(0, desc=f"Downloading {name} ({size}) from HuggingFace …")
+    from huggingface_hub import snapshot_download
+    # Gradio's Progress(track_tqdm=True) captures huggingface_hub's tqdm bars,
+    # so the real byte-level transfer drives the on-screen bar.
+    snapshot_download(repo_id=repo)
+
+
+def _get_model(name: str, progress=None):
     if name not in _model_cache:
+        if progress is not None:
+            _ensure_downloaded(name, progress)
+            progress(0.9, desc=f"Loading {name} into memory …")
         from evo2 import Evo2
         _model_cache[name] = Evo2(name)
     return _model_cache[name]
@@ -135,22 +174,31 @@ def _fp8_banner(model_name: str) -> str:
 
 # --- Actions: load ------------------------------------------------------------
 
-def action_load(model_name: str, progress: gr.Progress = gr.Progress()):
-    progress(0, desc=f"Loading {model_name} ...")
+def action_load(model_name: str, progress: gr.Progress = gr.Progress(track_tqdm=True)):
+    """Download (if needed, with a live progress bar) and load the model."""
     t0 = time.time()
-    m, err = _require_model(model_name)
-    if err:
-        return err
+    cached = _is_cached(model_name)
+    try:
+        if not cached:
+            size = _APPROX_DOWNLOAD.get(model_name, "several GB")
+            progress(0, desc=f"Downloading {model_name} ({size}) …")
+        m = _get_model(model_name, progress=progress)
+        progress(1.0, desc="Ready")
+    except Exception as e:  # noqa: BLE001
+        return (
+            f"❌ Failed to load {model_name}: {type(e).__name__}: {e}\n"
+            f"Large models need lots of unified memory (20B ≈40 GB, 40B ≈80 GB)."
+        )
     warn = ""
     if model_name in FP8_EMULATED:
         warn = (
-            "Note: FP8-trained checkpoint running with e4m3 emulation (no "
-            "Transformer Engine on Mac). Recovers most of the FP8 accuracy; "
-            "evo2_7b_base is still the most accurate.\n\n"
+            "ℹ️ FP8-trained checkpoint running with e4m3 emulation; recovers most "
+            "of the FP8 accuracy. `evo2_7b_base` is still the most accurate.\n\n"
         )
+    verb = "loaded" if cached else "downloaded & loaded"
     return (
-        f"{warn}{model_name} loaded in {time.time() - t0:.1f}s on device {m.device}.\n"
-        f"Ready: Forward / Score / Variant / Embeddings / Batch."
+        f"{warn}✅ {model_name} {verb} in {time.time() - t0:.1f}s on {m.device}.\n"
+        f"Ready — use any tab below: Forward / Score / Variant / Embeddings / Batch / Generate."
     )
 
 
@@ -443,26 +491,120 @@ def action_generate(model_name: str, sequence: str, n_tokens: int,
 
 REDUCE_CHOICES = [("mean (per-base avg)", "mean"), ("sum (PLL)", "sum")]
 
-with gr.Blocks(title="evo2Mac", theme=gr.themes.Soft()) as demo:
-    gr.Markdown(
-        f"# 🧬 evo2Mac\n"
-        f"Apple Silicon port of [Evo 2](https://github.com/arcinstitute/evo2). "
-        f"{_device_info()}.\n\n"
-        f"> **Use a 7B-8k checkpoint** (`evo2_7b_base`, the default) for real "
-        f"results — bf16-native, matches upstream's H100 reference. "
-        f"`evo2_1b_base` is FP8-degraded (near-random on Mac)."
-    )
+# Teal/aqua theme. Soft base with the primary hue swapped to teal; custom CSS
+# pushes the accent toward aqua on buttons, the active tab, and labels.
+THEME = gr.themes.Soft(
+    primary_hue=gr.themes.colors.teal,
+    secondary_hue=gr.themes.colors.cyan,
+    neutral_hue=gr.themes.colors.slate,
+    font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"],
+)
+
+# Accent presets: (base, bright, text-on-accent). Teal/aqua is the default.
+ACCENTS = {
+    "Aqua / Teal": ("#00c9b1", "#1ee3cf", "#042f2a"),
+    "Ocean Blue":  ("#2f7df6", "#5aa0ff", "#03122e"),
+    "Violet":      ("#8b5cf6", "#a78bfa", "#1a0b33"),
+    "Coral":       ("#fb6f5b", "#ff8f7e", "#330c06"),
+    "Lime":        ("#84cc16", "#a3e635", "#13260a"),
+}
+DEFAULT_ACCENT = "Aqua / Teal"
+
+CSS = """
+:root {
+  --accent: #00c9b1;
+  --accent-bright: #1ee3cf;
+  --accent-text: #042f2a;
+}
+#evo2-header {
+  background: linear-gradient(100deg,
+    color-mix(in srgb, var(--accent) 16%, transparent),
+    color-mix(in srgb, var(--accent) 3%, transparent));
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  border-radius: 14px; padding: 16px 20px; margin-bottom: 6px;
+}
+#evo2-header h1 { margin: 0 0 4px 0; font-weight: 700; letter-spacing: -0.5px; }
+button.primary, .primary > button {
+  background: linear-gradient(90deg, var(--accent), var(--accent-bright)) !important;
+  border: none !important; color: var(--accent-text) !important; font-weight: 600 !important;
+}
+button.primary:hover, .primary > button:hover { filter: brightness(1.08); }
+.tab-nav button.selected {
+  color: var(--accent-bright) !important;
+  border-bottom: 2px solid var(--accent-bright) !important;
+}
+.gradio-container span[data-testid="block-info"], label > span { color: var(--accent) !important; }
+.progress-bar, .meta-text + div .progress-bar { background: var(--accent-bright) !important; }
+"""
+
+# JS: apply an accent (by name) and toggle dark/light by flipping Gradio's
+# .dark class on <body>. Runs in the browser, so it's live with no reload.
+SET_ACCENT_JS = """
+(name) => {
+  const map = %s;
+  const a = map[name] || map[%r];
+  const r = document.documentElement.style;
+  r.setProperty('--accent', a[0]);
+  r.setProperty('--accent-bright', a[1]);
+  r.setProperty('--accent-text', a[2]);
+  return name;
+}
+""" % (
+    "{" + ",".join(f'{k!r}:[{v[0]!r},{v[1]!r},{v[2]!r}]' for k, v in ACCENTS.items()) + "}",
+    DEFAULT_ACCENT,
+)
+
+SET_MODE_JS = """
+(mode) => {
+  const dark = (mode === 'Dark');
+  document.body.classList.toggle('dark', dark);
+  return mode;
+}
+"""
+
+
+def _model_choices():
+    """Dropdown labels showing each model's size and cached/download state."""
+    out = []
+    for name, info in MAC_FEASIBLE.items():
+        tag = "✓ cached" if _is_cached(name) else "⬇ will download"
+        out.append((f"{name}  ·  {info}  ·  {tag}", name))
+    return out
+
+
+with gr.Blocks(title="evo2Mac", theme=THEME, css=CSS) as demo:
+    with gr.Column(elem_id="evo2-header"):
+        with gr.Row():
+            gr.Markdown(
+                f"# 🧬 evo2Mac\n"
+                f"Run **Evo 2** genome models locally on Apple Silicon — "
+                f"forward pass, scoring, variant effects, embeddings & generation. "
+                f"_{_device_info()}._"
+            )
+            with gr.Column(min_width=180, scale=0):
+                mode_sel = gr.Radio(
+                    ["Light", "Dark"], value="Light", label="Theme", scale=0,
+                )
+                accent_sel = gr.Dropdown(
+                    list(ACCENTS.keys()), value=DEFAULT_ACCENT,
+                    label="Highlight color", scale=0,
+                )
+        # Live appearance controls — run JS in the browser (no reload).
+        mode_sel.change(None, inputs=[mode_sel], outputs=None, js=SET_MODE_JS)
+        accent_sel.change(None, inputs=[accent_sel], outputs=None, js=SET_ACCENT_JS)
 
     with gr.Row():
         model_dd = gr.Dropdown(
-            label="Model",
-            choices=[(f"{name}  —  {info}", name) for name, info in MAC_FEASIBLE.items()],
+            label="① Choose a model",
+            info="Not downloaded yet? It auto-downloads from HuggingFace on load, with a progress bar.",
+            choices=_model_choices(),
             value=DEFAULT_MODEL,
             scale=4,
         )
-        load_btn = gr.Button("Load model", variant="primary", scale=1)
+        load_btn = gr.Button("② Load / Download", variant="primary", scale=1)
     fp8_md = gr.Markdown(_fp8_banner(DEFAULT_MODEL))
-    load_status = gr.Textbox(label="Status", interactive=False, lines=2)
+    load_status = gr.Textbox(label="Status", interactive=False, lines=2,
+                             value="Pick a model and click Load. First load of a new model downloads it.")
     load_btn.click(action_load, inputs=[model_dd], outputs=[load_status])
     model_dd.change(lambda n: _fp8_banner(n), inputs=[model_dd], outputs=[fp8_md])
 
