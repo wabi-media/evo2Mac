@@ -282,43 +282,78 @@ def action_score(model_name: str, sequence: str, rc_avg: bool,
 
 # --- Actions: variant ---------------------------------------------------------
 
-def action_variant(model_name: str, wt: str, mut: str, rc_avg: bool,
-                   reduce_method: str):
-    for label, s in (("Wild-type", wt), ("Mutant", mut)):
-        err = _validate_dna(s)
+def _apply_snv(seq: str, pos1: int, alt: str) -> tuple[str | None, str | None]:
+    """Apply a 1-indexed single-nucleotide variant; return (mutant, error)."""
+    p = int(pos1) - 1
+    if p < 0 or p >= len(seq):
+        return None, f"Position {pos1} is outside the sequence (length {len(seq)})."
+    alt = (alt or "").upper().strip()
+    if alt not in "ACGT" or len(alt) != 1:
+        return None, f"ALT must be a single base A/C/G/T (got {alt!r})."
+    return seq[:p] + alt + seq[p + 1:], None
+
+
+def action_variant(model_name: str, mode: str, wt: str, mut: str,
+                   snv_seq: str, snv_pos: int, snv_alt: str,
+                   rc_avg: bool, reduce_method: str):
+    """Zero-shot variant effect: delta log-likelihood (variant − reference).
+
+    This is the BRCA1-notebook scoring: a more-negative delta means the variant
+    lowers the model's likelihood, predicting greater functional disruption.
+    """
+    if mode == "SNV (ref + position + alt base)":
+        ref = _clean(snv_seq)
+        err = _validate_dna(ref)
         if err:
-            return f"{label}: {err}", None
-    wt, mut = _clean(wt), _clean(mut)
+            return f"Reference: {err}", None
+        ref_base = ref[int(snv_pos) - 1] if 0 < int(snv_pos) <= len(ref) else "?"
+        var, err = _apply_snv(ref, snv_pos, snv_alt)
+        if err:
+            return err, None
+        label = f"SNV {ref_base}{int(snv_pos)}{snv_alt.upper()}"
+    else:
+        ref, var = _clean(wt), _clean(mut)
+        for nm, s in (("Reference", ref), ("Variant", var)):
+            e = _validate_dna(s)
+            if e:
+                return f"{nm}: {e}", None
+        label = "variant vs reference"
+
     m, merr = _require_model(model_name)
     if merr:
         return merr, None
 
     t0 = time.time()
-    scores = m.score_sequences(
-        [wt, mut],
-        batch_size=2,
-        reduce_method=reduce_method,
-        average_reverse_complement=rc_avg,
-    )
+    scores = m.score_sequences([ref, var], batch_size=2,
+                               reduce_method=reduce_method,
+                               average_reverse_complement=rc_avg)
     elapsed = time.time() - t0
-    wt_s, mut_s = float(scores[0]), float(scores[1])
-    delta = mut_s - wt_s
-    verdict = (
-        "mutant is *more* likely (Δ > 0)" if delta > 0
-        else "mutant is *less* likely (Δ < 0 — possible deleterious effect)"
-        if delta < 0 else "no change"
-    )
+    ref_s, var_s = float(scores[0]), float(scores[1])
+    delta = var_s - ref_s  # evo2_delta_score: var − ref
+
+    if delta <= -0.10:
+        call = "likely DISRUPTIVE (strongly lowers likelihood)"
+    elif delta < -0.02:
+        call = "possibly disruptive (lowers likelihood)"
+    elif delta <= 0.02:
+        call = "near-neutral"
+    else:
+        call = "tolerated / favorable (raises likelihood)"
+
+    note = ""
+    if model_name in FP8_EMULATED:
+        note = "\n(1B runs with FP8 emulation — good for exploration; the 7B is more accurate.)"
     msg = (
-        f"Scored 2 sequences in {elapsed:.2f}s on {m.device}\n"
-        f"WT  logprob: {wt_s:.4f}\n"
-        f"Mut logprob: {mut_s:.4f}\n"
-        f"Δ (mut − wt): {delta:+.4f}  →  {verdict}\n\n"
-        f"More negative Δ = the variant lowers the model's likelihood, a proxy "
-        f"for functional disruption. Compare against many variants for calibration."
+        f"{label} — scored in {elapsed:.2f}s on {m.device}\n"
+        f"reference logprob: {ref_s:.4f}\n"
+        f"variant   logprob: {var_s:.4f}\n"
+        f"Δ delta-likelihood (var − ref): {delta:+.4f}  →  {call}\n\n"
+        f"This is the zero-shot VEP score from Evo 2's BRCA1 analysis: more "
+        f"negative = more likely to disrupt function. Calibrate thresholds against "
+        f"a labeled panel for your locus.{note}"
     )
-    df = pd.DataFrame(
-        {"sequence": ["wild-type", "mutant"], "logprob": [wt_s, mut_s]}
-    )
+    df = pd.DataFrame({"sequence": ["reference", "variant"],
+                       "logprob": [round(ref_s, 4), round(var_s, 4)]})
     return msg, df
 
 
@@ -637,27 +672,48 @@ with gr.Blocks(title="evo2Mac", theme=THEME, css=CSS) as demo:
         sc_btn.click(action_score, inputs=[model_dd, seq_sc, sc_rc, sc_reduce, sc_bos],
                      outputs=[sc_out])
 
-    # --- Variant ---
+    # --- Variant (zero-shot VEP) ---
     with gr.Tab("Variant"):
         gr.Markdown(
-            "Score a **wild-type** vs a **mutant** sequence and report the "
-            "Δ log-likelihood — evo2's flagship variant-effect use case."
+            "**Zero-shot variant effect prediction.** Reports the Δ delta-likelihood "
+            "(variant − reference) — the same score Evo 2's BRCA1 analysis uses: "
+            "more negative ⇒ more likely to disrupt function. "
+            "Give either a full reference/variant pair, or a single-nucleotide "
+            "variant as reference + position + alt base."
         )
-        with gr.Row():
-            seq_wt = gr.Textbox(label="Wild-type (ACGT)", value=EXAMPLE_SEQ, lines=3)
-            seq_mut = gr.Textbox(
-                label="Mutant (ACGT)",
-                value=EXAMPLE_SEQ[:20] + "A" + EXAMPLE_SEQ[21:], lines=3,
-            )
+        var_mode = gr.Radio(
+            ["SNV (ref + position + alt base)", "Reference / variant pair"],
+            value="SNV (ref + position + alt base)", label="Input mode",
+        )
+        with gr.Group() as snv_group:
+            snv_seq = gr.Textbox(label="Reference sequence (ACGT)", value=EXAMPLE_SEQ, lines=3)
+            with gr.Row():
+                snv_pos = gr.Number(label="Variant position (1-indexed)", value=21, precision=0)
+                snv_alt = gr.Textbox(label="Alt base (A/C/G/T)", value="A", max_lines=1)
+        with gr.Group(visible=False) as pair_group:
+            with gr.Row():
+                seq_wt = gr.Textbox(label="Reference (ACGT)", value=EXAMPLE_SEQ, lines=3)
+                seq_mut = gr.Textbox(label="Variant (ACGT)",
+                                     value=EXAMPLE_SEQ[:20] + "A" + EXAMPLE_SEQ[21:], lines=3)
         with gr.Row():
             var_reduce = gr.Dropdown(label="Reduce", choices=REDUCE_CHOICES, value="mean")
-            var_rc = gr.Checkbox(label="Average with reverse complement", value=False)
-        var_btn = gr.Button("Score variant", variant="primary")
-        var_out = gr.Textbox(label="Result", interactive=False, lines=7)
-        var_plot = gr.BarPlot(x="sequence", y="logprob", title="WT vs mutant logprob",
-                              height=220)
-        var_btn.click(action_variant, inputs=[model_dd, seq_wt, seq_mut, var_rc, var_reduce],
-                      outputs=[var_out, var_plot])
+            var_rc = gr.Checkbox(label="Average with reverse complement", value=True)
+        var_btn = gr.Button("Predict variant effect", variant="primary")
+        var_out = gr.Textbox(label="Result", interactive=False, lines=8)
+        var_plot = gr.BarPlot(x="sequence", y="logprob",
+                              title="reference vs variant logprob", height=220)
+
+        var_mode.change(
+            lambda mode: (gr.update(visible=mode.startswith("SNV")),
+                          gr.update(visible=not mode.startswith("SNV"))),
+            inputs=[var_mode], outputs=[snv_group, pair_group],
+        )
+        var_btn.click(
+            action_variant,
+            inputs=[model_dd, var_mode, seq_wt, seq_mut, snv_seq, snv_pos, snv_alt,
+                    var_rc, var_reduce],
+            outputs=[var_out, var_plot],
+        )
 
     # --- Embeddings ---
     with gr.Tab("Embeddings"):
