@@ -77,7 +77,50 @@ class Evo2:
             if hasattr(self.model, "block_idx_to_device"):
                 for k in list(self.model.block_idx_to_device):
                     self.model.block_idx_to_device[k] = self.device
-    
+
+        # Mac/MPS: optional FP8 (e4m3) emulation for FP8-trained checkpoints
+        # (1B/20B/40B). Without Transformer Engine these run de-quantized in
+        # bf16 and produce near-random output; emulating TE's per-tensor e4m3
+        # input projections recovers most of the lost accuracy. Off by default
+        # (the 7B-8k checkpoints don't need it); enable with
+        # EVO2MAC_FP8_EMULATION=1.
+        if (
+            os.environ.get("EVO2MAC_FP8_EMULATION") == "1"
+            and not torch.cuda.is_available()
+            and not HAS_TE
+        ):
+            try:
+                from evo2.fp8_emulation import apply_fp8_emulation
+                ckpt = self._resolve_checkpoint_path(model_name, local_path)
+                if ckpt is not None:
+                    n = apply_fp8_emulation(self.model, ckpt)
+                    if n:
+                        warnings.warn(
+                            f"Applied FP8 e4m3 emulation to {n} input projection(s) "
+                            f"for '{model_name}'. This recovers accuracy lost to the "
+                            f"bf16 fallback on Apple Silicon."
+                        )
+            except Exception as e:  # never block model load on emulation
+                warnings.warn(f"FP8 emulation could not be applied: {e}")
+
+    @staticmethod
+    def _resolve_checkpoint_path(model_name, local_path):
+        """Locate the merged .pt the model was loaded from (for FP8 scale
+        recovery). Mirrors load_evo2_model's path logic."""
+        if local_path is not None:
+            return local_path
+        if model_name is None:
+            return None
+        filename = f"{model_name}.pt"
+        cached = os.path.join(os.path.dirname(constants.HF_HUB_CACHE), filename)
+        if os.path.exists(cached):
+            return cached
+        import glob
+        hits = glob.glob(
+            os.path.expanduser(f"~/.cache/huggingface/**/{filename}"), recursive=True
+        )
+        return hits[0] if hits else None
+
     def forward(
         self,
         input_ids: torch.Tensor,

@@ -279,6 +279,39 @@ in the [Models table](#models) above.)
 Running an FP8-required model (1B/20B/40B) prints an explicit warning that the
 result will be degraded and points you at `evo2_7b_base`.
 
+### Experimental: FP8 (e4m3) emulation recovers most of the lost 1B accuracy
+
+The degradation above is *recoverable*. Transformer Engine's input-projection
+math is per-tensor **delayed scaling** in e4m3, and the checkpoint's
+`*.projections._extra_state` blobs store the exact forward scales (slot 0 =
+activation, slot 1 = weight). `evo2/fp8_emulation.py` reads those scales and
+replicates TE's forward GEMM — `round_e4m3(x·act_scale) @ round_e4m3(W·w_scale)ᵀ`,
+then dequantize — in pure PyTorch that runs on MPS. The e4m3 rounding is
+bit-exact against `torch.float8_e4m3fn` (which casts on CPU but not MPS).
+
+Enable it with an env flag (off by default; the 7B path is untouched):
+
+```bash
+EVO2MAC_FP8_EMULATION=1 python scripts/test_dna.py --model evo2_1b_base
+python scripts/validate_fp8_emulation.py        # measures before/after
+```
+
+On `evo2_1b_base`, 4 prompts at full 8K context:
+
+```
+reference (H100, FP8):  loss=0.502   acc=79.6%
+bf16 fallback:          loss=1.3643  acc=32.63%
+e4m3 emulated:          loss=0.6105  acc=74.51%   (+41.9 pp)
+```
+
+That closes the gap from ~47 pp to ~5 pp. The residual is expected — we don't
+replicate flash-attn or the rest of the H100 FP8 path, only the input
+projections. This is **emulation, not hardware FP8**: on M1–M4 (no FP8 silicon)
+there's no speed benefit, the point is accuracy. On an **M5** (native GPU FP8),
+`quantize_e4m3` is the seam to swap for a real FP8 matmul (`torch._scaled_mm`
+once MPS exposes it, or an MLX `mxfp8` kernel) — the per-tensor scales recovered
+here are exactly what such a path needs.
+
 > The 7B-8k checkpoint is ~15 GB and needs ~16 GB+ of unified memory; it fits
 > on a 32 GB Mac comfortably and is tight on 16–18 GB. On an 18 GB Mac the
 > weights (~14 GB) load fine, but a full 8K-context forward pass exceeds the
