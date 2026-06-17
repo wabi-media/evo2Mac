@@ -263,6 +263,28 @@ This section is a candid record, including dead ends.
 
 ---
 
+## 5b. Fork Survey: Prior Art
+
+To check whether any solution already existed, we crawled all **505 forks** of
+`arcinstitute/evo2` (via the GitHub API), filtered to those that diverge from the
+upstream baseline, and inspected every Mac/MPS/CPU/FP8-relevant candidate:
+
+| Fork | Change | Solves FP8 on non-Hopper? |
+|---|---|---|
+| `gtaghon/evo2-mps` ("MPS-compatible") | vortex-level MPS patches; README still requires FP8 / Compute Capability 8.9+ for 1B/20B/40B; no FP8 handling in `models.py` | No |
+| `YDXCPU/evo2` (ahead 7) | sets `use_fp8_input_projections: False` on the **7B** configs only + test tweaks | No |
+| `hakyimlab/evo2-mac` | upstream README + bf16 fallback; does not rescue even the 1B | No |
+| `hiixryo/evo2` (ahead 1) | a scoring script + build artifacts | No |
+| ~490 others | identical push timestamp/size to baseline — untouched clones | No |
+
+A GitHub-wide code search for `float8_e4m3 StripedHyena` and
+`quantize_e4m3 vortex mps` returned **zero results**. To our knowledge, no prior
+work implements FP8 emulation for this architecture. The positive result (1B
+recovery) and the diagnosed negative result (20B) are, as far as the public fork
+network shows, the first of their kind.
+
+---
+
 ## 6. Limitations
 
 - The H100 reference is an aggregate over four prompts; upstream publishes no
