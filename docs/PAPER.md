@@ -255,11 +255,33 @@ This section is a candid record, including dead ends.
   land at ~445 (just below 448), so **0% clamp**. The emulation already handles
   outliers as TE intended; the residual is intrinsic precision loss. *Dead end,
   but a clean one.*
+- **Current / just-in-time scaling.** TE supports both *delayed* scaling (the
+  stored amax history) and *current* scaling (compute the scale from the actual
+  tensor amax at runtime). We had used the stored delayed scales; we re-ran the
+  20B computing `act_scale = 448 / |x|.amax()` per forward instead. Result: 21.65%
+  → 21.51% — **no change.** The scaling recipe is irrelevant here, which is the
+  decisive confirmation: with e4m3 ≈ bf16 for the 20B's value ranges, no FP8
+  scaling variant has anything to recover. *Dead end.*
+- **Transformer Engine on CPU (the real FP8 path).** We checked whether TE — which
+  *is* numerically correct — could run off-GPU. It cannot: TE requires CUDA 12.1+
+  and device compute capability 9.x; its FP8 GEMMs fail or silently fall back to
+  higher precision without Hopper/Ada/Blackwell tensor cores. There is no
+  CPU/MPS path to TE's actual FP8 arithmetic. *Not available.*
 - **CPU-vs-MPS and FP8-math diffs.** The two tests that actually settled the 20B.
   *Worked — as diagnostics.*
 - **Other Mac ports.** An independent port (`hakyimlab/evo2-mac`) reaches the same
-  wall: it documents the Hopper requirement and does not rescue even the 1B.
-  *Independent confirmation.*
+  wall: it documents the Hopper requirement and does not rescue even the 1B. A
+  fork survey (all 505 forks + a GitHub code search; see §5b) found no fork that
+  solves FP8 on non-Hopper hardware. *Independent confirmation.*
+
+**Summary of the 20B attempts.** Every software avenue is exhausted: bf16 fallback,
+projection-only and all-117-layer emulation, fp32 and bf16 and current/JIT
+scaling, activation clamping, and the device dimension (CPU ≡ MPS) — none move
+the 20B off ~25%. The cause is not any of these; it is that the model's learned
+function depends on the *exact* FP8 forward it trained with, whose effect on the
+20B's outlier-heavy activations compounds over ~120 layers and cannot be
+reproduced in higher precision (§4.5). This is a property of the checkpoint, not
+the port.
 
 ---
 
@@ -300,6 +322,31 @@ network shows, the first of their kind.
 
 ---
 
+## 6b. What Would Actually Run the 20B/40B
+
+For completeness — having shown no software path on this Mac works — the
+genuinely viable routes, each requiring different hardware or a changed model:
+
+1. **An FP8-capable NVIDIA GPU** (compute capability ≥ 8.9 — Ada/Hopper/Blackwell,
+   e.g. an RTX 4090, or a rented H100). This runs the *real* Transformer Engine
+   FP8 path the checkpoints expect; it is the only way to get the published
+   accuracy. NVIDIA also hosts Evo 2 40B via an API.
+2. **An Apple M5 (or later) Mac.** The M5 GPU has native FP8 in its Neural
+   Accelerators. Once MLX / PyTorch-MPS expose an FP8 GEMM, a true (not emulated)
+   FP8 forward becomes possible on a Mac; the FP8-MPS library is structured so its
+   quantizer is the seam to swap for that kernel.
+3. **Produce a bf16-native 20B.** Fine-tuning / re-exporting the 20B without FP8
+   input projections (via BioNemo or Savanna on GPU) would yield a checkpoint that
+   runs accurately in bf16 anywhere — at the cost of a GPU training run.
+4. **Use the 7B.** The bf16-native 7B-8k checkpoints already match H100 on this
+   Mac (§4.1) and are the right local workhorse today; the 1B is usable with
+   emulation. For most local-inference needs this is the pragmatic answer.
+
+The takeaway: the 20B limit is a hardware/format boundary, not an engineering gap
+to close in software on M1–M4 Apple Silicon.
+
+---
+
 ## 7. Conclusion
 
 We ported Evo 2 to Apple Silicon and showed that an FP8-trained model can be
@@ -325,6 +372,8 @@ general FP8-on-Apple-Silicon library validated on a real PTQ FP8 model.
   MoE RL.* 2025.
 - Liang et al. *TWEO: Transformers Without Extreme Outliers Enables FP8 Training
   and Quantization.* CVPR 2026.
+- NVIDIA. *Transformer Engine — Installation* (CUDA 12.1+ / compute capability 9.x
+  requirement). docs.nvidia.com.
 - PyTorch issue #132624: *Add float8 dtypes for the MPS backend.*
 
 ---
