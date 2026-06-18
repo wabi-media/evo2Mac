@@ -155,9 +155,11 @@ confirming the port's device handling, rotary, Hyena FFT, and unembed are correc
 | bf16 native (no FP8) | 1.3643 | 32.63% | −46.93 pp |
 | **e4m3 emulated** | 0.6105 | **74.51%** | **−5.05 pp** |
 
-A second, independent axis — greedy generation identity (H100 ref 68.0%) —
-corroborates: bf16 ≈30% → emulated ≈70%. The residual ~5 pp is consistent with
-the parts of the H100 path we do not replicate (flash-attn; the full TE recipe).
+A second, independent axis, greedy-generation identity (H100 reference 68.0%),
+corroborates the result: the bf16 fallback scores approximately 30% and the
+emulated model approximately 70%. The residual of about 5 pp is consistent with
+the parts of the H100 path we do not replicate (flash-attn and the full
+Transformer Engine recipe).
 
 ### 4.3 The 20B does *not* recover (primary negative result)
 
@@ -230,58 +232,65 @@ PyTorch/MPS cannot do natively.
 
 ---
 
-## 5. What Worked, What Didn't, and What We Tried (Engineering Log)
+## 5. Engineering Log: Methods Attempted
 
-This section is a candid record, including dead ends.
+This section records each approach evaluated, including those that did not
+succeed, for reproducibility and to document the full design space explored.
 
 - **bf16 fallback (baseline).** Loads the FP8 models but yields near-random output
-  for 1B/20B/40B. Correct for the 7B. *Worked for 7B only.*
-- **Projection-only e4m3 emulation.** Rescued the 1B (32.6% → 74.5%). *Worked.*
-- **Defaulting emulation on for the 7B.** Measured no-op (±0.05 pp), since the 7B
-  is bf16-native; we deliberately exclude it. *Correctly scoped out.*
+  for the 1B/20B/40B. Correct for the 7B. Outcome: effective for the 7B only.
+- **Projection-only e4m3 emulation.** Recovered the 1B from 32.6% to 74.5%
+  accuracy. Outcome: effective.
+- **Defaulting emulation on for the 7B.** Measured as a no-op (within +/-0.05 pp),
+  since the 7B is bf16-native; it is therefore deliberately excluded. Outcome:
+  correctly scoped out.
 - **Full-layer emulation for the 20B (117 linears).** Required generalizing the
-  scale extractor (read all `_extra_state`) and adding a return-convention flag
-  (MLPs are plain `nn.Linear` returning a bare tensor, not TE's `(out, bias)`
-  tuple — an early `TypeError`). Ran correctly but **did not improve 20B accuracy.**
-  *Didn't work — but produced the diagnosis.*
-- **fp32 pre-scaling "fix".** Switching `x · act_scale` from bf16 to fp32 made the
-  emulation match generic native FP8 better (and is correct for the FP8-MPS
-  library), but **regressed the 1B** (74.5% → 39%): Evo 2's scales are tuned to the
-  bf16-scaling path `vortex` actually uses. *Reverted in evo2Mac; kept in FP8-MPS.*
-  A reminder that "more numerically generic" ≠ "better for this model."
-- **Activation-clamp hypothesis.** We suspected unclamped activation outliers were
-  the 20B's problem and considered clamping them harder. Measurement killed it:
-  the stored activation scales are *perfectly calibrated* — max scaled activations
-  land at ~445 (just below 448), so **0% clamp**. The emulation already handles
-  outliers as TE intended; the residual is intrinsic precision loss. *Dead end,
-  but a clean one.*
-- **Current / just-in-time scaling.** TE supports both *delayed* scaling (the
-  stored amax history) and *current* scaling (compute the scale from the actual
-  tensor amax at runtime). We had used the stored delayed scales; we re-ran the
-  20B computing `act_scale = 448 / |x|.amax()` per forward instead. Result: 21.65%
-  → 21.51% — **no change.** The scaling recipe is irrelevant here, which is the
-  decisive confirmation: with e4m3 ≈ bf16 for the 20B's value ranges, no FP8
-  scaling variant has anything to recover. *Dead end.*
-- **Transformer Engine on CPU (the real FP8 path).** We checked whether TE — which
-  *is* numerically correct — could run off-GPU. It cannot: TE requires CUDA 12.1+
-  and device compute capability 9.x; its FP8 GEMMs fail or silently fall back to
-  higher precision without Hopper/Ada/Blackwell tensor cores. There is no
-  CPU/MPS path to TE's actual FP8 arithmetic. *Not available.*
-- **CPU-vs-MPS and FP8-math diffs.** The two tests that actually settled the 20B.
-  *Worked — as diagnostics.*
-- **Other Mac ports.** An independent port (`hakyimlab/evo2-mac`) reaches the same
-  wall: it documents the Hopper requirement and does not rescue even the 1B. A
-  fork survey (all 505 forks + a GitHub code search; see §5b) found no fork that
-  solves FP8 on non-Hopper hardware. *Independent confirmation.*
+  scale extractor to read all `_extra_state` blobs and adding a return-convention
+  flag (the MLPs are plain `nn.Linear` modules returning a bare tensor rather than
+  Transformer Engine's `(out, bias)` tuple, which initially raised a `TypeError`).
+  The pass ran correctly but did not improve 20B accuracy. Outcome: ineffective;
+  it produced the diagnosis in Section 4.5.
+- **fp32 pre-scaling.** Computing `x * act_scale` in fp32 rather than bf16 improves
+  agreement with generic native FP8 (and is correct for the FP8-MPS library), but
+  it regressed the 1B from 74.5% to 39%: Evo 2's stored scales are tuned to the
+  bf16-scaling path that `vortex` uses at inference. Outcome: reverted in evo2Mac,
+  retained in FP8-MPS. The discrepancy illustrates that a more numerically generic
+  formulation is not necessarily better for a specific model.
+- **Activation-clamp hypothesis.** We hypothesized that unclamped activation
+  outliers were the cause and considered clamping them more aggressively.
+  Measurement excluded this: the stored activation scales are well calibrated, so
+  the maximum scaled activations land near 445 (just below the e4m3 maximum of
+  448) and essentially no values are clamped. The emulation already handles
+  outliers as Transformer Engine intends; the residual is intrinsic precision
+  loss. Outcome: ineffective.
+- **Current (just-in-time) scaling.** Transformer Engine supports both delayed
+  scaling (a stored amax history) and current scaling (the scale computed from the
+  actual tensor amax at runtime). Having used the stored delayed scales, we re-ran
+  the 20B computing `act_scale = 448 / |x|.amax()` per forward pass. Accuracy moved
+  from 21.65% to 21.51%, i.e. no meaningful change. This confirms that the scaling
+  recipe is not the limiting factor: because e4m3 is numerically close to bf16 for
+  the 20B's value ranges, no scaling variant has appreciable precision to recover.
+  Outcome: ineffective.
+- **Transformer Engine on CPU.** We evaluated whether Transformer Engine, which is
+  numerically correct, could run off-GPU. It cannot: it requires CUDA 12.1+ and
+  device compute capability 9.x, and its FP8 GEMMs fail or fall back to higher
+  precision without Hopper, Ada, or Blackwell tensor cores. There is no CPU or MPS
+  path to its FP8 arithmetic. Outcome: not available.
+- **CPU-versus-MPS and FP8-math differential tests.** The two diagnostics that
+  localized the cause (Section 4.4). Outcome: effective as diagnostics.
+- **Survey of related ports.** An independent port (`hakyimlab/evo2-mac`) reaches
+  the same limit, documenting the Hopper requirement and not recovering the 1B. A
+  survey of all 505 forks plus a code search (Section 5b) found no fork that solves
+  FP8 inference on non-Hopper hardware. Outcome: independent confirmation.
 
-**Summary of the 20B attempts.** Every software avenue is exhausted: bf16 fallback,
-projection-only and all-117-layer emulation, fp32 and bf16 and current/JIT
-scaling, activation clamping, and the device dimension (CPU ≡ MPS) — none move
-the 20B off ~25%. The cause is not any of these; it is that the model's learned
-function depends on the *exact* FP8 forward it trained with, whose effect on the
-20B's outlier-heavy activations compounds over ~120 layers and cannot be
-reproduced in higher precision (§4.5). This is a property of the checkpoint, not
-the port.
+**Summary of the 20B attempts.** Every software avenue was exhausted: the bf16
+fallback; projection-only and all-117-layer emulation; fp32, bf16, and current
+scaling; activation clamping; and the device dimension (CPU and MPS agree). None
+move the 20B off approximately 25% accuracy. The cause is none of these; rather,
+the model's learned function depends on the precise FP8 forward computation it was
+trained with, whose effect on the 20B's outlier-heavy activations compounds across
+roughly 120 layers and cannot be reproduced in higher precision (Section 4.5).
+This is a property of the checkpoint, not of the port.
 
 ---
 
